@@ -56,6 +56,27 @@ def batch_composition(conn: sqlite3.Connection, batch_id: int) -> Composition:
     return _expand(kinds, recipes, batch_id, {})
 
 
+def plan_portions(
+    share_a: Fraction, share_b: Fraction, target: Fraction
+) -> tuple[int, int] | None:
+    """反算两种原料的最小正整数投入份数 (x, y)，使目标样本在新混样中的占比恰为 target。
+
+    share_a / share_b 是目标样本在两种原料中的占比。由
+    (x·share_a + y·share_b) / (x + y) = target 得 x/y = (target − share_b)/(share_a − target)，
+    其最简分数即总份数最小的正整数解（其余解都是它的整数倍）。
+    两种原料占比都等于目标时任意比例均可，按约定取 1:1；
+    目标无法由正整数份数达到时返回 None。
+    """
+    if share_a == target and share_b == target:
+        return (1, 1)
+    if share_a == target or share_b == target:
+        return None  # 之一恰为目标值时，另一个须投入 0 份，不存在正整数解
+    ratio = (target - share_b) / (share_a - target)
+    if ratio <= 0:
+        return None  # 目标占比不在两种原料占比之间
+    return (ratio.numerator, ratio.denominator)
+
+
 def downstream_batches(recipes: Recipes, batch_id: int) -> list[int]:
     """沿配方引用关系找出全部下游批次（含目标自身）。
 

@@ -2,6 +2,7 @@
 
 - POST /samples                        登记原始样本
 - POST /pools                          创建混样批次（引用已有批次 + 正整数份数）
+- POST /pool-plans                     规划混样配方（反算达到目标占比的最小份数，不写库）
 - GET  /batches                        列出全部批次
 - GET  /batches/{batch_id}             批次详情（混样含配方）
 - GET  /batches/{batch_id}/composition 递归计算原始样本占比（约分后的分子/分母）
@@ -24,13 +25,15 @@ from .schemas import (
     CompositionOut,
     FractionOut,
     PoolCreate,
+    PoolPlanOut,
+    PoolPlanRequest,
     PreviewComponentOut,
     RecipeItemOut,
     RecipePreviewOut,
     RecipePreviewRequest,
     SampleCreate,
 )
-from .service import batch_composition, recipe_preview
+from .service import batch_composition, plan_portions, recipe_preview
 
 
 @asynccontextmanager
@@ -151,6 +154,95 @@ def create_pool(payload: PoolCreate, conn: sqlite3.Connection = Depends(get_db))
             status.HTTP_409_CONFLICT, detail=f"批次名称已存在: {payload.name}"
         ) from None
     return _batch_out(conn, _fetch_batch(conn, pool_id))
+
+
+@app.post(
+    "/pool-plans",
+    response_model=PoolPlanOut,
+    summary="规划混样配方（只规划，不创建批次）",
+)
+def plan_pool(payload: PoolPlanRequest, conn: sqlite3.Connection = Depends(get_db)) -> PoolPlanOut:
+    ids = [payload.ingredient_a_id, payload.ingredient_b_id, payload.sample_id]
+    info = {
+        row["id"]: row
+        for row in conn.execute(
+            "SELECT id, name, kind FROM batches WHERE id IN (?, ?, ?)", ids
+        )
+    }
+    missing = [i for i in ids if i not in info]
+    if missing:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {missing}"
+        )
+    if info[payload.sample_id]["kind"] != "sample":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"不是原始样本: {payload.sample_id}",
+        )
+
+    # 沿用现有精确占比计算，取目标样本在两种原料中的占比（原料不含该样本时视为 0）
+    comp_a = batch_composition(conn, payload.ingredient_a_id)
+    comp_b = batch_composition(conn, payload.ingredient_b_id)
+    target = Fraction(payload.target_numerator, payload.target_denominator)
+    share_a = comp_a.get(payload.sample_id, Fraction(0))
+    share_b = comp_b.get(payload.sample_id, Fraction(0))
+
+    solution = plan_portions(share_a, share_b, target)
+    if solution is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"目标占比 {target} 无法由正整数份数达到: "
+                f"目标样本在两种原料中的占比为 {share_a} 与 {share_b}"
+            ),
+        )
+    portions_a, portions_b = solution
+    total = portions_a + portions_b
+    if total > payload.max_total_portions:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"最小总份数 {total} 超过上限 {payload.max_total_portions}",
+        )
+
+    portions_by_id = {
+        payload.ingredient_a_id: portions_a,
+        payload.ingredient_b_id: portions_b,
+    }
+
+    # 新混样的全部原始样本占比：按份数加权合并两种原料的占比
+    merged: dict[int, Fraction] = {}
+    for ingredient_id, portions in portions_by_id.items():
+        share = Fraction(portions, total)
+        composition = comp_a if ingredient_id == payload.ingredient_a_id else comp_b
+        for sample_id, frac in composition.items():
+            merged[sample_id] = merged.get(sample_id, Fraction(0)) + share * frac
+
+    names = {
+        r["id"]: r["name"]
+        for r in conn.execute(
+            "SELECT id, name FROM batches WHERE id IN (%s)"
+            % ", ".join("?" for _ in merged),
+            list(merged),
+        )
+    }
+    return PoolPlanOut(
+        recipe=[
+            RecipeItemOut(
+                batch_id=i, batch_name=info[i]["name"], portions=portions_by_id[i]
+            )
+            for i in sorted(portions_by_id)
+        ],
+        total_portions=total,
+        composition=[
+            ComponentOut(
+                sample_id=sample_id,
+                sample_name=names[sample_id],
+                numerator=frac.numerator,
+                denominator=frac.denominator,
+            )
+            for sample_id, frac in sorted(merged.items())
+        ],
+    )
 
 
 @app.get("/batches", response_model=list[BatchOut], summary="列出全部批次")

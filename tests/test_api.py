@@ -327,3 +327,170 @@ def test_recipe_preview_non_positive_or_non_integer_portions_rejected(client, po
     s1 = make_sample(client, "S1")
     p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
     assert preview(client, p1, [{"batch_id": s1, "portions": portions}]).status_code == 422
+
+
+def plan(client, a, b, sample, num, den, max_total=100):
+    return client.post("/pool-plans", json={
+        "ingredient_a_id": a,
+        "ingredient_b_id": b,
+        "sample_id": sample,
+        "target_numerator": num,
+        "target_denominator": den,
+        "max_total_portions": max_total,
+    })
+
+
+def test_pool_plan_basic_and_recipe_directly_submittable(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    # S1 在原料中的占比为 1 与 0，目标 1/4 → x/y = (1/4-0)/(1-1/4) = 1/3
+    r = plan(client, s1, s2, s1, 1, 4)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["recipe"] == [
+        {"batch_id": s1, "batch_name": "S1", "portions": 1},
+        {"batch_id": s2, "batch_name": "S2", "portions": 3},
+    ]
+    assert body["total_portions"] == 4
+    assert {(c["sample_id"], c["numerator"], c["denominator"]) for c in body["composition"]} == {
+        (s1, 1, 4),
+        (s2, 3, 4),
+    }
+
+    # 返回的配方可直接提交 /pools，创建出的混样占比与规划结果一致
+    created = make_pool(client, "PX", body["recipe"])
+    assert fractions_of(client, created) == {s1: (1, 4), s2: (3, 4)}
+
+
+def test_pool_plan_multilevel_ingredients(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+    ])
+    # P1 中 S1 占 1/2，S2 中占 0，目标 1/3 → x/y = (1/3-0)/(1/2-1/3) = 2/1
+    r = plan(client, p1, s2, s1, 1, 3)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["recipe"] == [
+        {"batch_id": s2, "batch_name": "S2", "portions": 1},
+        {"batch_id": p1, "batch_name": "P1", "portions": 2},
+    ]
+    assert body["total_portions"] == 3
+    assert {(c["sample_id"], c["numerator"], c["denominator"]) for c in body["composition"]} == {
+        (s1, 1, 3),
+        (s2, 2, 3),
+    }
+
+
+def test_pool_plan_both_ingredients_at_target_gives_one_to_one(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+    ])
+    p2 = make_pool(client, "P2", [
+        {"batch_id": s1, "portions": 3},
+        {"batch_id": s2, "portions": 3},
+    ])
+    # 两种原料中 S1 占比都是 1/2，目标也是 1/2 → 约定取 1:1
+    r = plan(client, p1, p2, s1, 1, 2)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["recipe"] == [
+        {"batch_id": p1, "batch_name": "P1", "portions": 1},
+        {"batch_id": p2, "batch_name": "P2", "portions": 1},
+    ]
+    assert body["total_portions"] == 2
+
+
+def test_pool_plan_target_zero(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    # 两种原料都不含 S3，目标 0 → 任意比例均可，取 1:1
+    r = plan(client, s1, s2, s3, 0, 1)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total_portions"] == 2
+    assert s3 not in {c["sample_id"] for c in body["composition"]}
+    # 只有一种原料不含目标样本时，0 无法由正整数份数达到
+    assert plan(client, s1, s2, s1, 0, 1).status_code == 422
+
+
+def test_pool_plan_unachievable_returns_422(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+    ])  # S1 占 1/2
+    p2 = make_pool(client, "P2", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 3},
+    ])  # S1 占 1/4
+    # 目标超出两种原料占比的范围（两侧都不行）
+    assert plan(client, p1, p2, s1, 3, 4).status_code == 422
+    assert plan(client, p1, p2, s1, 1, 8).status_code == 422
+    # 目标恰等于其中一种原料的占比（另一个须投入 0 份，非正整数解）
+    assert plan(client, p1, p2, s1, 1, 2).status_code == 422
+    assert plan(client, p1, p2, s1, 1, 4).status_code == 422
+    # 两种原料占比相同但目标不同
+    p3 = make_pool(client, "P3", [
+        {"batch_id": s1, "portions": 2},
+        {"batch_id": s2, "portions": 2},
+    ])  # S1 占 1/2
+    assert plan(client, p1, p3, s1, 1, 3).status_code == 422
+
+
+def test_pool_plan_min_solution_exceeds_max_returns_422(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    # 最小解为 1+3=4 份：上限 3 → 422，上限 4 → 200
+    r = plan(client, s1, s2, s1, 1, 4, max_total=3)
+    assert r.status_code == 422
+    assert "4" in r.json()["detail"] and "3" in r.json()["detail"]
+    assert plan(client, s1, s2, s1, 1, 4, max_total=4).status_code == 200
+
+
+def test_pool_plan_does_not_create_batch(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    before = client.get("/batches").json()
+    r = plan(client, s1, s2, s1, 1, 4)
+    assert r.status_code == 200, r.text
+    assert client.get("/batches").json() == before
+
+
+def test_pool_plan_same_ingredient_rejected(client):
+    s1 = make_sample(client, "S1")
+    assert plan(client, s1, s1, s1, 1, 2).status_code == 422
+
+
+@pytest.mark.parametrize("num,den", [(2, 1), (1, 0), (-1, 2), (1.5, 2), ("1", 2)])
+def test_pool_plan_invalid_target_ratio_rejected(client, num, den):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    assert plan(client, s1, s2, s1, num, den).status_code == 422
+
+
+@pytest.mark.parametrize("max_total", [0, -1, 1.5, "10", True])
+def test_pool_plan_invalid_max_total_rejected(client, max_total):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    assert plan(client, s1, s2, s1, 1, 2, max_total=max_total).status_code == 422
+
+
+def test_pool_plan_unknown_or_wrong_kind_rejected(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+    # 未知原料 / 未知样本 → 400
+    assert plan(client, s1, 999, s1, 1, 2).status_code == 400
+    assert plan(client, s1, s2, 999, 1, 2).status_code == 400
+    # 目标样本不是原始样本 → 400
+    r = plan(client, s1, s2, p1, 1, 2)
+    assert r.status_code == 400
+    assert str(p1) in r.json()["detail"]

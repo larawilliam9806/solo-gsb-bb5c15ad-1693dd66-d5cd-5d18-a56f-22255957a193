@@ -3,10 +3,13 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # 严格的正整数：拒绝 0、负数、浮点数（如 1.5 / 2.0）与字符串（如 "3"）
 StrictPositiveInt = Annotated[int, Field(strict=True, gt=0)]
+
+# 严格的非负整数：同样拒绝浮点数与字符串
+StrictNonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 
 BatchName = Annotated[str, Field(min_length=1, max_length=200)]
 
@@ -51,6 +54,31 @@ class CompositionOut(BaseModel):
     batch_name: BatchName
     kind: Literal["sample", "pool"]
     components: list[ComponentOut]
+
+
+class PoolPlanRequest(BaseModel):
+    """混样规划请求：两种已有原料 + 已有原始样本 + 目标占比 + 总份数上限。"""
+
+    ingredient_a_id: StrictPositiveInt
+    ingredient_b_id: StrictPositiveInt
+    sample_id: StrictPositiveInt
+    target_numerator: StrictNonNegativeInt  # 目标占比分子
+    target_denominator: StrictPositiveInt   # 目标占比分母
+    max_total_portions: StrictPositiveInt   # 总份数上限
+
+    @model_validator(mode="after")
+    def _check_plan(self) -> PoolPlanRequest:
+        if self.ingredient_a_id == self.ingredient_b_id:
+            raise ValueError("两种原料批次必须不同")
+        if self.target_numerator > self.target_denominator:
+            raise ValueError("目标占比需满足 0 ≤ 分子 ≤ 分母")
+        return self
+
+
+class PoolPlanOut(BaseModel):
+    recipe: list[RecipeItemOut]      # 两项配方，可直接作为 /pools 的 recipe 提交
+    total_portions: int              # 最小解的总份数
+    composition: list[ComponentOut]  # 新混样全部原始样本占比（约分后）
 
 
 class RecipePreviewRequest(BaseModel):
