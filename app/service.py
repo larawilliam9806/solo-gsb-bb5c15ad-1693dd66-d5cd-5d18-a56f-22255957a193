@@ -5,11 +5,16 @@ Fraction 会自动约分，分子/分母即为最简形式。
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 from fractions import Fraction
 
 Composition = dict[int, Fraction]  # {原始样本 id: 占比}
 Recipes = dict[int, list[tuple[int, int]]]  # {混样批次 id: [(原料批次 id, 份数)]}
+
+
+class PoolPlanError(ValueError):
+    """混样规划在业务上无解（目标不可达或最小解超过总份数上限），对应 HTTP 422。"""
 
 
 def _load_graph(conn: sqlite3.Connection) -> tuple[dict[int, str], Recipes]:
@@ -100,3 +105,72 @@ def recipe_preview(
         )
         for bid in affected
     }
+
+
+def pool_plan(
+    conn: sqlite3.Connection,
+    ingredient_a: int,
+    ingredient_b: int,
+    sample_id: int,
+    target: Fraction,
+    max_total_portions: int,
+) -> tuple[int, int, Composition]:
+    """反算两个原料的正整数投入份数 (portions_a, portions_b)，使 sample_id 在
+    新混样（仅由这两个原料按份数混合）中的占比恰好等于 target。
+
+    设两原料中该样本的精确占比分别为 a、b（沿用 _expand 的分数展开），新混样
+    占比 = (a·x + b·y) / (x + y) = target（x、y 为正整数份数）。一般情况下该
+    方程的正整数解构成一族 x:y 固定的等比解，把比值约到最简即得到总份数最小
+    的唯一解；当 a == b == target 时任意份数都满足，按约定取 1:1。无正整数解
+    或最小总份数超过上限时抛 PoolPlanError。
+
+    返回 (portions_a, portions_b, 新混样全部原始样本占比)。
+    """
+    kinds, recipes = _load_graph(conn)
+    memo: dict[int, Composition] = {}
+    comp_a = _expand(kinds, recipes, ingredient_a, memo)
+    comp_b = _expand(kinds, recipes, ingredient_b, memo)
+
+    a = comp_a.get(sample_id, Fraction(0))
+    b = comp_b.get(sample_id, Fraction(0))
+
+    if a == b:
+        # 两原料中该样本占比相同：只有目标也相等时才有解，且任意正整数份数都满足，
+        # 按要求取总份数最小的 1:1；否则目标在区间之外。
+        if a != target:
+            raise PoolPlanError(
+                f"目标占比 {target.numerator}/{target.denominator} 无法用正整数份数达到: "
+                f"两原料中该样本占比均为 {a.numerator}/{a.denominator}"
+            )
+        portions_a, portions_b = 1, 1
+    else:
+        # 目标必须严格落在两原料占比之间：区间之外（含只与一端相等）时，
+        # 正份数加权平均不可能达到——相等端点会迫使另一原料投入 0 份。
+        if not (min(a, b) < target < max(a, b)):
+            raise PoolPlanError(
+                f"目标占比 {target.numerator}/{target.denominator} 无法用正整数份数达到: "
+                f"两原料中该样本占比为 {a.numerator}/{a.denominator}、{b.numerator}/{b.denominator}"
+            )
+        # (a - target)·x = (target - b)·y，两侧同号非零；交叉相乘后约到最简
+        left = a - target
+        right = target - b
+        x_num = abs(right.numerator * left.denominator)
+        y_num = abs(left.numerator * right.denominator)
+        g = math.gcd(x_num, y_num)
+        portions_a = x_num // g
+        portions_b = y_num // g
+
+    total = portions_a + portions_b
+    if total > max_total_portions:
+        raise PoolPlanError(
+            f"最小整数解总份数为 {total}，超过上限 {max_total_portions}"
+        )
+
+    share_a = Fraction(portions_a, total)
+    share_b = Fraction(portions_b, total)
+    composition: Composition = {}
+    for sid, frac in comp_a.items():
+        composition[sid] = composition.get(sid, Fraction(0)) + share_a * frac
+    for sid, frac in comp_b.items():
+        composition[sid] = composition.get(sid, Fraction(0)) + share_b * frac
+    return portions_a, portions_b, composition

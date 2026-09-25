@@ -2,6 +2,7 @@
 
 - POST /samples                        登记原始样本
 - POST /pools                          创建混样批次（引用已有批次 + 正整数份数）
+- POST /pool-plans                     按目标占比反算整数份数配方（只规划，不创建批次）
 - GET  /batches                        列出全部批次
 - GET  /batches/{batch_id}             批次详情（混样含配方）
 - GET  /batches/{batch_id}/composition 递归计算原始样本占比（约分后的分子/分母）
@@ -24,13 +25,16 @@ from .schemas import (
     CompositionOut,
     FractionOut,
     PoolCreate,
+    PoolPlanOut,
+    PoolPlanRecipeItemOut,
+    PoolPlanRequest,
     PreviewComponentOut,
     RecipeItemOut,
     RecipePreviewOut,
     RecipePreviewRequest,
     SampleCreate,
 )
-from .service import batch_composition, recipe_preview
+from .service import PoolPlanError, batch_composition, pool_plan, recipe_preview
 
 
 @asynccontextmanager
@@ -151,6 +155,80 @@ def create_pool(payload: PoolCreate, conn: sqlite3.Connection = Depends(get_db))
             status.HTTP_409_CONFLICT, detail=f"批次名称已存在: {payload.name}"
         ) from None
     return _batch_out(conn, _fetch_batch(conn, pool_id))
+
+
+@app.post(
+    "/pool-plans",
+    response_model=PoolPlanOut,
+    summary="按目标占比规划混样配方（不创建批次）",
+)
+def plan_pool(
+    payload: PoolPlanRequest, conn: sqlite3.Connection = Depends(get_db)
+) -> PoolPlanOut:
+    # 两个原料与目标样本都必须是已存在的批次；未知批次沿用 /pools 的 400 校验
+    ids = [payload.ingredient_a_batch_id, payload.ingredient_b_batch_id, payload.sample_id]
+    placeholders = ", ".join("?" for _ in ids)
+    rows = {
+        row["id"]: row
+        for row in conn.execute(
+            f"SELECT id, name, kind FROM batches WHERE id IN ({placeholders})", ids
+        )
+    }
+    missing = [i for i in ids if i not in rows]
+    if missing:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {missing}")
+    if rows[payload.sample_id]["kind"] != "sample":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"目标样本必须是原始样本（kind='sample'）: {payload.sample_id}",
+        )
+
+    target = Fraction(payload.numerator, payload.denominator)
+    try:
+        portions_a, portions_b, composition = pool_plan(
+            conn,
+            payload.ingredient_a_batch_id,
+            payload.ingredient_b_batch_id,
+            payload.sample_id,
+            target,
+            payload.max_total_portions,
+        )
+    except PoolPlanError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from None
+
+    # 新混样涉及的原始样本名称一次性解析
+    sample_ids = sorted(composition)
+    placeholders = ", ".join("?" for _ in sample_ids)
+    names = {
+        r["id"]: r["name"]
+        for r in conn.execute(
+            f"SELECT id, name FROM batches WHERE id IN ({placeholders})", sample_ids
+        )
+    }
+    components = [
+        ComponentOut(
+            sample_id=sid,
+            sample_name=names[sid],
+            numerator=composition[sid].numerator,
+            denominator=composition[sid].denominator,
+        )
+        for sid in sample_ids
+    ]
+
+    return PoolPlanOut(
+        sample_id=payload.sample_id,
+        target=FractionOut(numerator=target.numerator, denominator=target.denominator),
+        total_portions=portions_a + portions_b,
+        recipe=[
+            PoolPlanRecipeItemOut(
+                batch_id=payload.ingredient_a_batch_id, portions=portions_a
+            ),
+            PoolPlanRecipeItemOut(
+                batch_id=payload.ingredient_b_batch_id, portions=portions_b
+            ),
+        ],
+        components=components,
+    )
 
 
 @app.get("/batches", response_model=list[BatchOut], summary="列出全部批次")

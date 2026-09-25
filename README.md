@@ -8,6 +8,7 @@
 - 创建校验：拒绝**空配方**（422）、**未知批次**（400）、**非正整数份数**（422，含 0、负数、小数、字符串）
 - 新批次只能引用**已创建**的批次，引用关系天然构成有向无环图，不可能成环
 - 占比追溯：按每层“投入份数 / 该层总份数”递归分摊；同一原始样本经多条路径到达时**自动合并**；基于 `fractions.Fraction` 精确有理数运算，返回**约分后**的分子与分母
+- **目标占比规划**：给定两个不同的已有批次、一个原始样本与目标占比，反算使新混样精确达标的**正整数投入份数**，只返回总份数最小的整数解（两原料占比都等于目标时取 1:1），配方可直接提交 `/pools`；**只规划、不创建批次**
 - **配方变更影响预演**：提交完整替代配方，在内存中演算目标批次及全部下游批次各原始样本的原占比、预演占比与有符号差值，**不修改数据库**
 - 依赖安装与数据库建表全部纳入启动流程，无需手工初始化
 
@@ -45,6 +46,7 @@ docker compose up --build
 | --- | --- | --- |
 | `POST` | `/samples` | 登记原始样本 |
 | `POST` | `/pools` | 创建混样批次 |
+| `POST` | `/pool-plans` | 按目标占比反算整数份数配方（只规划，不写库） |
 | `GET` | `/batches` | 列出全部批次 |
 | `GET` | `/batches/{id}` | 批次详情（混样含配方） |
 | `GET` | `/batches/{id}/composition` | 递归追溯原始样本占比 |
@@ -163,6 +165,50 @@ curl -X POST http://localhost:8000/batches/3/recipe-preview \
 - 某样本在新配方下占比降为 0 时，以 `0/1` 返回，差值为负；
 - 预演**不修改数据库**：调用前后 `/batches/{id}` 与 `/batches/{id}/composition` 的结果保持原样。
 
+### 6. 按目标占比规划混样配方
+
+`POST /pool-plans` 接收两个**不同的已有批次 id**（`ingredient_a_batch_id`、`ingredient_b_batch_id`）、一个已有**原始样本** id（`sample_id`）、目标占比（`numerator` / `denominator`，要求 `0 ≤ 分子 ≤ 分母` 且分母 > 0）以及正整数总份数上限 `max_total_portions`。
+
+接口沿用上面的精确占比计算：设两原料中该样本的占比分别为 `a`、`b`，新混样按正整数份数 `x:y` 混合后占比为 `(a·x + b·y)/(x + y)`。接口反算使该占比**恰好等于**目标的正整数份数，只返回**总份数最小**的整数解；当两原料占比都等于目标时任意份数都满足，按约定取 `1:1`。返回的 `recipe` 可**直接作为 `/pools` 的配方提交**，`components` 给出新混样的全部原始样本精确占比。接口只做规划，**不创建任何批次**。
+
+以第 4 节的 P2（S1 占 3/4）和 S2（S1 占 0）为原料，规划 S1 恰好占 1/2、总份数上限 10：
+
+```bash
+curl -X POST http://localhost:8000/pool-plans \
+  -H 'Content-Type: application/json' \
+  -d '{"ingredient_a_batch_id": 4, "ingredient_b_batch_id": 2, "sample_id": 1, "numerator": 1, "denominator": 2, "max_total_portions": 10}'
+```
+
+```json
+{
+  "sample_id": 1,
+  "target": {"numerator": 1, "denominator": 2},
+  "total_portions": 3,
+  "recipe": [
+    {"batch_id": 4, "portions": 2},
+    {"batch_id": 2, "portions": 1}
+  ],
+  "components": [
+    {"sample_id": 1, "sample_name": "S1", "numerator": 1, "denominator": 2},
+    {"sample_id": 2, "sample_name": "S2", "numerator": 1, "denominator": 2}
+  ]
+}
+```
+
+校验：`2×P2 + 1×S2` 中 S1 = 2/3×3/4 = 1/2。把 `recipe` 原样提交即可创建该混样：
+
+```bash
+curl -X POST http://localhost:8000/pools \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "P3", "recipe": [{"batch_id": 4, "portions": 2}, {"batch_id": 2, "portions": 1}]}'
+```
+
+说明：
+
+- 目标占比**无法由正整数份数达到**时返回 **422**：包括目标落在两原料占比区间之外，或目标只等于其中一端（会迫使另一原料投入 0 份）；
+- 最小整数解的**总份数超过上限**时返回 **422**，错误信息中给出最小总份数与上限；恰好等于上限时正常返回；
+- 两原料 id 相同、分子 > 分母、分母 ≤ 0、份数上限非正整数等请求格式问题返回 **422**；引用不存在的批次返回 **400**；`sample_id` 指向混样批次（非原始样本）返回 **400**。
+
 ### 错误示例
 
 ```bash
@@ -185,6 +231,14 @@ curl http://localhost:8000/batches/999/composition
 curl -X POST http://localhost:8000/batches/3/recipe-preview \
   -H 'Content-Type: application/json' \
   -d '{"recipe": [{"batch_id": 4, "portions": 1}]}'
+
+# 规划目标无法由正整数份数达到（P2 与 S1 中 S1 占比为 3/4、1，目标 1/4 在区间之外）→ 422
+curl -X POST http://localhost:8000/pool-plans -H 'Content-Type: application/json' \
+  -d '{"ingredient_a_batch_id": 4, "ingredient_b_batch_id": 1, "sample_id": 1, "numerator": 1, "denominator": 4, "max_total_portions": 10}'
+
+# 规划的最小整数解超过总份数上限（2/3 需要 2+1=3 份）→ 422
+curl -X POST http://localhost:8000/pool-plans -H 'Content-Type: application/json' \
+  -d '{"ingredient_a_batch_id": 1, "ingredient_b_batch_id": 2, "sample_id": 1, "numerator": 2, "denominator": 3, "max_total_portions": 2}'
 ```
 
 ## 占比计算说明
@@ -208,12 +262,12 @@ pytest                                 # 运行测试（使用临时数据库，
 
 ```
 app/
-  main.py       # FastAPI 路由与请求处理（含配方变更预演端点）
+  main.py       # FastAPI 路由与请求处理（含目标占比规划、配方变更预演端点）
   db.py         # SQLite 连接与建表（启动时自动执行）
   schemas.py    # Pydantic 请求/响应模型（含严格正整数校验）
-  service.py    # 递归占比计算与配方预演（Fraction 精确分数）
+  service.py    # 递归占比计算、目标占比反算与配方预演（Fraction 精确分数）
 tests/
-  test_api.py   # 端到端测试（含多级合并、约分、配方预演、各类非法输入）
+  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、各类非法输入）
 Dockerfile
 docker-compose.yml
 requirements.txt
